@@ -1,9 +1,7 @@
 import { chromium } from 'playwright';
 import fs from 'fs';
 import path from 'path';
-import dotenv from 'dotenv';
-
-dotenv.config();
+import { logger } from './utils/logger.js';
 
 const CONFIG = {
   url: 'https://www.green-japan.com/favorites/received',
@@ -11,13 +9,12 @@ const CONFIG = {
   outputDir: 'output',
   outputFile: 'companies.json',
   selectors: {
-    jobCard: '.job-card, li.job, article.job, [class*="job"]', // 求人記事のカード
-    jobLink: 'a[href*="/company/"]', // 求人記事へのリンク
-    companyTab: 'a[data-tab="company"], a:has-text("企業"), li[role="tab"]:has-text("企業")', // 企業タブ
-    companyName: '.company-name, h1.company, .company-header h1, [class*="companyName"]', // 企業名
-    industry: '.industry, .industry-tag, [class*="industry"]', // 業種
-    location: '.location, .office-location, [class*="location"]', // 所在地
-    description: '.description, .company-desc, [class*="description"]' // 説明
+    jobLink: '#__next a[href*="/company/"]',
+    companyTab: 'a:has-text("企業"), [data-tab="company"], li[role="tab"]:has-text("企業")',
+    companyName: '.company-name, h1.company, [class*="companyName"], h1:has-text("株式会社"), h1:has-text("合同会社")',
+    industry: '[class*="industry"], .industry-tag',
+    location: '[class*="location"], .office-location',
+    description: '[class*="description"], .company-desc, p:has-text("事業内容")'
   }
 };
 
@@ -25,178 +22,193 @@ async function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-async function saveAuthState(context) {
-  const state = await context.storageState();
-  fs.writeFileSync(CONFIG.storageState, JSON.stringify(state, null, 2));
-  console.log('✅ セッション状態を保存しました:', CONFIG.storageState);
-}
-
 async function restoreAuth(context) {
+  logger.info('Checking for auth state: ' + CONFIG.storageState);
   if (fs.existsSync(CONFIG.storageState)) {
     const state = JSON.parse(fs.readFileSync(CONFIG.storageState, 'utf-8'));
     await context.restoreStorageState(state);
-    console.log('✅ セッション状態を復元しました');
+    logger.authState(true, CONFIG.storageState);
+    logger.debug('Auth state restored with cookies: ' + (state.cookies ? state.cookies.length : 0));
     return true;
   }
+  logger.authState(false, CONFIG.storageState);
   return false;
 }
 
-async function scrapeCompanyInfo(page) {
-  const companyData = {};
+async function scrapeCompanyInfo(page, index, total) {
+  logger.info('[' + (index + 1) + '/' + total + '] Extracting company info');
+  
+  const companyData = {
+    name: 'N/A',
+    industry: 'N/A',
+    location: 'N/A',
+    description: 'N/A',
+    url: page.url(),
+    timestamp: new Date().toISOString()
+  };
   
   try {
-    // 企業名
-    companyData.name = await page.$eval(CONFIG.selectors.companyName, el => el.textContent.trim()).catch(() => '取得できませんでした');
+    // Company name
+    const nameEl = await page.$(CONFIG.selectors.companyName);
+    if (nameEl) {
+      companyData.name = await nameEl.textContent();
+      companyData.name = companyData.name.trim();
+      logger.elementFound(CONFIG.selectors.companyName, 1);
+    } else {
+      logger.elementNotFound(CONFIG.selectors.companyName);
+      // Save page source for debugging
+      fs.writeFileSync('company-page-source.html', await page.content());
+      logger.warn('Page source saved to: company-page-source.html');
+    }
     
-    // 業種
-    const industryElements = await page.$$(CONFIG.selectors.industry);
-    companyData.industry = industryElements.map(el => el.textContent.trim()).join(', ') || '取得できませんでした';
+    // Industry
+    const industryEls = await page.$$(CONFIG.selectors.industry);
+    if (industryEls.length > 0) {
+      companyData.industry = industryEls.map(el => el.textContent().then(t => t.trim())).filter(Boolean).join(', ');
+      logger.elementFound(CONFIG.selectors.industry, industryEls.length);
+    } else {
+      logger.elementNotFound(CONFIG.selectors.industry);
+    }
     
-    // 所在地
-    const locationElements = await page.$$(CONFIG.selectors.location);
-    companyData.location = locationElements.map(el => el.textContent.trim()).join(', ') || '取得できませんでした';
+    // Location
+    const locationEls = await page.$$(CONFIG.selectors.location);
+    if (locationEls.length > 0) {
+      companyData.location = locationEls.map(el => el.textContent().then(t => t.trim())).filter(Boolean).join(', ');
+      logger.elementFound(CONFIG.selectors.location, locationEls.length);
+    } else {
+      logger.elementNotFound(CONFIG.selectors.location);
+    }
     
-    // 説明
-    const descriptionElement = await page.$(CONFIG.selectors.description);
-    companyData.description = descriptionElement ? descriptionElement.textContent.trim().slice(0, 500) : '取得できませんでした';
+    // Description
+    const descEl = await page.$(CONFIG.selectors.description);
+    if (descEl) {
+      companyData.description = (await descEl.textContent()).trim().substring(0, 500);
+      logger.elementFound(CONFIG.selectors.description, 1);
+    } else {
+      logger.elementNotFound(CONFIG.selectors.description);
+    }
     
-    // ページの HTML を保存（後で分析用）
-    companyData.url = page.url();
-    companyData.timestamp = new Date().toISOString();
-    
-    console.log(`   企業名：${companyData.name}`);
+    logger.info('Extracted: ' + companyData.name);
   } catch (error) {
-    console.log(`   ❌ 企業情報の取得に失敗しました: ${error.message}`);
+    logger.error('Error extracting company info', error);
   }
   
   return companyData;
 }
 
 async function navigateToCompanyTab(page) {
-  try {
-    // 企業タブを探す
-    const companyTab = await page.$(CONFIG.selectors.companyTab);
-    
-    if (companyTab) {
-      await companyTab.click();
+  logger.debug('Looking for company tab');
+  const selectors = ['a:has-text("企業")', '[data-tab="company"]', 'li[role="tab"]:has-text("企業")'];
+  
+  for (const sel of selectors) {
+    const tab = await page.$(sel);
+    if (tab) {
+      logger.info('Found company tab: ' + sel);
+      await tab.click();
       await sleep(2000);
-      console.log('   → 企業タブへ移動しました');
+      logger.info('Navigated to company tab');
       return true;
-    } else {
-      console.log('   ⚠️ 企業タブが見つかりませんでした');
-      return false;
     }
-  } catch (error) {
-    console.log(`   ❌ タブ遷移に失敗しました: ${error.message}`);
-    return false;
   }
+  
+  logger.warn('Company tab not found with any selector');
+  return false;
 }
 
 async function processJobCard(page, jobLink, index, total) {
-  console.log(`\n[${index + 1}/${total}] 求人記事を開いています...`);
-  
-  // リンクを取得
-  const href = await jobLink.getProperty('href').then(prop => prop.jsonValue());
   const title = await jobLink.textContent();
+  logger.scrapeItem(index, total, title);
   
-  console.log(`   タイトル：${title?.slice(0, 50)}`);
+  const href = await jobLink.getAttribute('href');
+  logger.debug('Job link: ' + href);
   
-  // 新しいタブで開く
   const [newPage] = await Promise.all([
     page.context().waitForEvent('popup'),
     jobLink.click()
   ]);
   
+  const startTime = Date.now();
   try {
     await newPage.waitForLoadState('networkidle', { timeout: 15000 });
+    const loadTime = Date.now() - startTime;
+    logger.http('GET', newPage.url(), 200, loadTime);
     await sleep(2000);
     
-    // 企業タブへ移動
-    const hasCompanyTab = await navigateToCompanyTab(newPage);
-    
-    // 企業情報を抽出
-    const companyData = await scrapeCompanyInfo(newPage);
+    await navigateToCompanyTab(newPage);
+    const data = await scrapeCompanyInfo(newPage, index, total);
     
     await newPage.close();
-    
-    return companyData;
+    return data;
   } catch (error) {
-    console.log(`   ❌ エラー: ${error.message}`);
-    try {
-      await newPage.close();
-    } catch (e) {}
+    logger.error('Error processing job ' + (index + 1), error);
+    await newPage.close().catch(() => {});
     return null;
   }
 }
 
 async function main() {
-  console.log('🚀 スクレイピングを開始します...\n');
+  logger.start();
+  logger.scrapeStart(CONFIG.url);
   
   let browser;
   let page;
   const results = [];
   
   try {
-    browser = await chromium.launch({ 
-      headless: false,
-      slowMo: 300
-    });
+    logger.info('Launching browser...');
+    browser = await chromium.launch({ headless: false, slowMo: 300 });
+    logger.info('Browser launched');
     
+    logger.info('Creating context...');
     const context = await browser.newContext({
       viewport: { width: 1920, height: 1080 },
       userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
     });
+    logger.info('Context created');
     
     page = await context.newPage();
+    logger.info('New page created');
     
-    // セッション復元
     const hasSession = await restoreAuth(context);
-    
     if (!hasSession) {
-      console.log('❌ セッション状態が見つかりません。まずログインしてください。\n');
-      console.log('実行方法: npm run test-login');
+      logger.error('No auth state found. Please run: npm run test-login');
       process.exit(1);
     }
     
-    // favorites/received ページへ移動
-    console.log(`📍 ${CONFIG.url} へ移動します...`);
-    await page.goto(CONFIG.url, { 
-      waitUntil: 'load',
-      timeout: 60000 
-    });
+    logger.info('Navigating to: ' + CONFIG.url);
+    const navStart = Date.now();
+    await page.goto(CONFIG.url, { waitUntil: 'load', timeout: 60000 });
+    const navTime = Date.now() - navStart;
+    logger.pageLoad(CONFIG.url, 200, navTime);
     await sleep(3000);
     
-    // 求人一覧の要素を取得
+    logger.info('Looking for job postings...');
     const jobLinks = await page.$$(CONFIG.selectors.jobLink);
-    console.log(`📋 取得した求人記事リンク数：${jobLinks.length}\n`);
+    logger.elementFound(CONFIG.selectors.jobLink, jobLinks.length);
     
     if (jobLinks.length === 0) {
-      console.log('⚠️ 求人記事が見つかりませんでした。セレクタを確認してください。');
-      console.log('HTML 構造を確認するために、ページソースを保存します...');
+      logger.error('No job postings found');
+      logger.warn('Saving page source for debugging...');
       fs.writeFileSync('page-source.html', await page.content());
       process.exit(1);
     }
     
-    // 各求人記事を処理
+    logger.info('Found ' + jobLinks.length + ' job postings');
+    
     for (let i = 0; i < jobLinks.length; i++) {
-      // リンクがまだ有効か確認
       const href = await jobLinks[i].getAttribute('href');
       if (!href) {
-        console.log(`[${i + 1}/${jobLinks.length}] リンクが無効です。スキップ...`);
+        logger.warn('[' + (i + 1) + '/' + jobLinks.length + '] Invalid link, skipping');
         continue;
       }
       
-      const companyData = await processJobCard(page, jobLinks[i], i, jobLinks.length);
-      
-      if (companyData) {
-        results.push(companyData);
-      }
-      
-      // 次の項目への過度な負荷を避ける
+      const data = await processJobCard(page, jobLinks[i], i, jobLinks.length);
+      if (data) results.push(data);
       await sleep(2000);
     }
     
-    // 結果を保存
+    logger.scrapeComplete(results.length);
+    
     if (!fs.existsSync(CONFIG.outputDir)) {
       fs.mkdirSync(CONFIG.outputDir, { recursive: true });
     }
@@ -206,16 +218,15 @@ async function main() {
       JSON.stringify(results, null, 2)
     );
     
-    console.log(`\n✅ 完了！ ${results.length}件の企業データを保存しました.`);
-    console.log(`📁 保存先：${path.join(CONFIG.outputDir, CONFIG.outputFile)}`);
+    logger.info('Saved to: ' + path.join(CONFIG.outputDir, CONFIG.outputFile));
+    logger.info('Retrieved ' + results.length + ' companies');
     
   } catch (error) {
-    console.error('\n❌ エラーが発生しました:', error.message);
+    logger.error('Fatal error', error);
     process.exit(1);
   } finally {
-    if (browser) {
-      await browser.close();
-    }
+    logger.stop();
+    if (browser) await browser.close();
   }
 }
 
