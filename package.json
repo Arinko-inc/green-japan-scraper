@@ -1,0 +1,19 @@
+{
+  "name": "green-japan-scraper",
+  "version": "1.0.0",
+  "description": "Green Japan 気になる企業リスト取得ツール",
+  "main": "src/index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node src/index.js",
+    "test-login": "node src/test-login.js",
+    "scrape": "node src/scrape.js"
+  },
+  "keywords": ["scraping", "playwright"],
+  "author": "Yukihiro Hemmi",
+  "license": "MIT",
+  "dependencies": {
+    "playwright": "^1.40.0",
+    "dotenv": "^16.3.1"
+  }
+}
